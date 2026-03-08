@@ -1,0 +1,27 @@
+{
+    "id": "2F6B2DF9",
+    "path": "~/Casus/script/Casus_CPI_kwartaalmutatie_.R",
+    "project_path": "script/Casus_CPI_kwartaalmutatie_.R",
+    "type": "r_source",
+    "hash": "3972980593",
+    "contents": "",
+    "dirty": false,
+    "created": 1772987920153.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "tempName": "Untitled1",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "176,1",
+        "scrollLine": "162"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1773000320,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1773000320416,
+    "read_only": false,
+    "read_only_alternatives": []
+}

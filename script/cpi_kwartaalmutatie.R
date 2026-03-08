@@ -1,0 +1,379 @@
+# Casus: CBS CPI Kwartaalmutatie – Huur en Zorgkosten
+
+install.packages(c("cbsodataR", "dplyr", "lubridate", "ggplot2", "DBI", "RSQLite"))
+
+library(cbsodataR)   # CBS OData API
+library(dplyr)       # Data manipulatie
+library(lubridate)   # Datumverwerking
+library(ggplot2)     # Grafieken
+library(DBI)         # Database interface
+library(RSQLite)     # SQLite driver
+
+zoek_categorie_keys <- function(categorienummers) {
+  
+  message(">>> Metadata ophalen om categoriecodes op te zoeken...")
+  
+  meta <- cbs_get_meta("83131NED")
+  cats <- meta$Bestedingscategorieen
+  
+  # Detecteer de juiste kolomnaam voor de omschrijving
+  zoek_kolom <- intersect(c("Description", "Title"), names(cats))[1]
+  if (is.na(zoek_kolom)) {
+    stop(paste("Geen titelkolom gevonden. Beschikbare kolommen:",
+               paste(names(cats), collapse = ", ")))
+  }
+  
+  # CBS-titels beginnen altijd met het 6-cijferig categorienummer, bijv:
+  # "041000 Huur van woning"
+  # Zoek op dat nummer als prefix – dit is stabieler dan op tekst zoeken
+  keys <- sapply(categorienummers, function(nummer) {
+    treffer <- cats$Key[startsWith(trimws(cats[[zoek_kolom]]), nummer)]
+    if (length(treffer) == 0) {
+      stop(paste0(
+        "Geen categorie gevonden voor nummer: '", nummer, "'\n",
+        "Beschikbare nummers (eerste 15):\n  ",
+        paste(substr(trimws(head(cats[[zoek_kolom]], 15)), 1, 6), collapse = "\n  ")
+      ))
+    }
+    treffer[1]
+  })
+  
+  # Log welke keys gevonden zijn inclusief bijbehorende omschrijving
+  for (i in seq_along(keys)) {
+    omschrijving <- cats[[zoek_kolom]][cats$Key == keys[i]]
+    message(paste0("  ", categorienummers[i], " -> key: ", keys[i],
+                   " (", substr(trimws(omschrijving), 1, 40), "...)"))
+  }
+  
+  return(unname(keys))
+}
+
+
+# =============================================================================
+# BLOK 1b – DATA OPHALEN
+# =============================================================================
+# Haalt ruwe maandcijfers op uit CBS StatLine via de OData API.
+# Geen externe bestanden – data komt rechtstreeks van CBS.
+#
+# Parameters : keys – output van zoek_categorie_keys()
+# Geeft terug: ruwe tibble met kolommen Bestedingscategorieen, Perioden, CPI_1
+
+haal_data_op <- function(keys) {
+  
+  message(">>> Data ophalen uit CBS StatLine (tabel 83131NED)...")
+  
+  cbs_get_data(
+    id                    = "83131NED",
+    Bestedingscategorieen = keys,
+    select                = c("Bestedingscategorieen", "Perioden", "CPI_1")
+  ) |>
+    cbs_add_label_columns()
+  # Noot: cbs_add_date_column() weggelaten – datum en kwartaal worden in
+  # schoon_data() berekend op basis van de Perioden-string (bijv. "2024MM01")
+}
+
+
+# =============================================================================
+# BLOK 2 – DATA OPSCHONEN
+# =============================================================================
+# Filtert op maandcijfers, voegt leesbare categorienamen toe,
+# en verwijdert rijen zonder indexwaarde.
+#
+# Parameters : raw – output van haal_data_op()
+# Geeft terug: opgeschoonde tibble met jaar, maand, kwartaal, categorie_label
+
+schoon_data <- function(raw) {
+  
+  message(">>> Data opschonen...")
+  
+  # CBS perioden hebben het formaat "2024MM01" (maand), "2024KW01" (kwartaal),
+  # "2024JJ00" (jaar). cbs_add_date_column() maakt niet altijd een freq-kolom
+  # aan, dus we filteren direct op het MM-patroon in de Perioden-string.
+  raw |>
+    filter(grepl("MM", Perioden)) |>
+    mutate(
+      jaar     = as.integer(substr(Perioden, 1, 4)),
+      maand    = as.integer(substr(Perioden, 7, 8)),
+      kwartaal = ceiling(as.integer(substr(Perioden, 7, 8)) / 3),
+      categorie_label = case_when(
+        grepl("Huur van woning",    Bestedingscategorieen_label, ignore.case = TRUE) ~ "Huur van woning",
+        grepl("Gezondheid en zorg", Bestedingscategorieen_label, ignore.case = TRUE) ~ "Gezondheid en zorg",
+        TRUE ~ Bestedingscategorieen_label
+      )
+    ) |>
+    filter(!is.na(CPI_1))
+}
+
+
+# =============================================================================
+# BLOK 3 – VERSLAGPERIODE FILTEREN
+# =============================================================================
+# Past een optionele periode-filter toe op de schoongemaakte data.
+# Geeft alle data terug als verslagperiode NULL is.
+#
+# Parameters:
+#   data           – output van schoon_data()
+#   verslagperiode – karakter, bijv. "2024" of "2023KW01", of NULL
+
+filter_periode <- function(data, verslagperiode) {
+  
+  if (is.null(verslagperiode)) return(data)
+  
+  if (nchar(verslagperiode) == 4) {
+    jaar_filter <- as.integer(verslagperiode)
+    data <- data |> filter(jaar == jaar_filter)
+    
+  } else {
+    jaar_filter <- as.integer(substr(verslagperiode, 1, 4))
+    kw_filter   <- as.integer(substr(verslagperiode, 7, 8))
+    data <- data |>
+      filter(jaar >= (jaar_filter - 1) |
+               (jaar == jaar_filter & kwartaal >= kw_filter))
+  }
+  
+  return(data)
+}
+
+
+# =============================================================================
+# BLOK 4 – KWARTAALGEMIDDELDEN BEREKENEN
+# =============================================================================
+# Groepeert maandcijfers per kwartaal en berekent het gemiddelde CPI-indexcijfer.
+# Alleen kwartalen met drie volledige maanden worden meegenomen.
+#
+# Parameters : data – output van filter_periode()
+# Geeft terug: tibble met gem_index per categorie, jaar en kwartaal
+
+bereken_kwartaalgemiddelde <- function(data) {
+  
+  message(">>> Kwartaalgemiddelden berekenen...")
+  
+  data |>
+    group_by(categorie_label, jaar, kwartaal) |>
+    summarise(
+      gem_index = mean(CPI_1, na.rm = TRUE),
+      n_maanden = n(),
+      .groups   = "drop"
+    ) |>
+    filter(n_maanden == 3) |>
+    arrange(categorie_label, jaar, kwartaal)
+}
+
+
+# =============================================================================
+# BLOK 5 – KWARTAALMUTATIE BEREKENEN
+# =============================================================================
+# Berekent de procentuele mutatie ten opzichte van het vorige kwartaal.
+# Voegt een leesbaar periodeLabel toe (bijv. "2024 K3").
+#
+# Parameters : kwartaal_data – output van bereken_kwartaalgemiddelde()
+# Geeft terug: tibble met kwartaalmutatie_pct en periode_label
+
+bereken_mutatie <- function(kwartaal_data) {
+  
+  message(">>> Kwartaalmutatie berekenen...")
+  
+  kwartaal_data |>
+    group_by(categorie_label) |>
+    mutate(
+      kwartaalmutatie_pct = round(
+        (gem_index / lag(gem_index) - 1) * 100,
+        digits = 2
+      ),
+      periode_label = paste0(jaar, " K", kwartaal)
+    ) |>
+    ungroup() |>
+    filter(!is.na(kwartaalmutatie_pct))
+}
+
+
+# =============================================================================
+# BLOK 6 – LIJNGRAFIEK MAKEN
+# =============================================================================
+# Maakt een lijngrafiek van de kwartaalmutatie over de volledige periode.
+# Slaat het resultaat op als PNG in ./output/
+#
+# Parameters : data – output van bereken_mutatie()
+
+maak_lijngrafiek <- function(data) {
+  
+  message(">>> Grafiek 1: lijngrafiek aanmaken...")
+  
+  # Kleuren dynamisch toewijzen op basis van de labels die daadwerkelijk
+  # in de data zitten – voorkomt mismatch als CBS-labels afwijken
+  unieke_labels <- unique(data$categorie_label)
+  palet         <- c("#00519E", "#F07D00", "#1E6B3A", "#7F4B00")
+  kleuren       <- setNames(palet[seq_along(unieke_labels)], unieke_labels)
+  
+  p <- ggplot(data, aes(x     = periode_label,
+                        y     = kwartaalmutatie_pct,
+                        color = categorie_label,
+                        group = categorie_label)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = kleuren) +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    labs(
+      title    = "Kwartaalmutatie consumentenprijsindex",
+      subtitle = "Huur van woning en Gezondheid & zorg | Bron: CBS StatLine (83131NED)",
+      x        = NULL,
+      y        = "Mutatie t.o.v. vorig kwartaal (%)",
+      color    = NULL,
+      caption  = paste("Berekend op:", Sys.Date())
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position  = "bottom",
+      plot.title       = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      axis.text.x      = element_text(size = 8)
+    )
+  
+  ggsave("output/grafiek1_lijngrafiek.png", p, width = 10, height = 5.5, dpi = 150)
+  message("    Opgeslagen: output/grafiek1_lijngrafiek.png")
+}
+
+
+# =============================================================================
+# BLOK 7 – STAAFDIAGRAM MAKEN
+# =============================================================================
+# Maakt een staafdiagram van de kwartaalmutatie voor de laatste 8 kwartalen.
+# Slaat het resultaat op als PNG in ./output/
+#
+# Parameters : data – output van bereken_mutatie()
+
+maak_staafdiagram <- function(data) {
+  
+  message(">>> Grafiek 2: staafdiagram aanmaken...")
+  
+  # Zelfde dynamische kleurlogica als in de lijngrafiek
+  unieke_labels <- unique(data$categorie_label)
+  palet         <- c("#00519E", "#F07D00", "#1E6B3A", "#7F4B00")
+  kleuren       <- setNames(palet[seq_along(unieke_labels)], unieke_labels)
+  
+  recent <- data |>
+    group_by(categorie_label) |>
+    slice_tail(n = 8) |>
+    ungroup()
+  
+  p <- ggplot(recent, aes(x    = periode_label,
+                          y    = kwartaalmutatie_pct,
+                          fill = categorie_label)) +
+    geom_col(position = "dodge", width = 0.7) +
+    geom_hline(yintercept = 0, color = "grey30") +
+    scale_fill_manual(values = kleuren) +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    labs(
+      title    = "Kwartaalmutatie CPI – laatste 8 kwartalen",
+      subtitle = "Huur van woning en Gezondheid & zorg | Bron: CBS StatLine (83131NED)",
+      x        = NULL,
+      y        = "Mutatie t.o.v. vorig kwartaal (%)",
+      fill     = NULL,
+      caption  = paste("Berekend op:", Sys.Date())
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position  = "bottom",
+      plot.title       = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      axis.text.x      = element_text(size = 9)
+    )
+  
+  ggsave("output/grafiek2_staafdiagram.png", p, width = 10, height = 5.5, dpi = 150)
+  message("    Opgeslagen: output/grafiek2_staafdiagram.png")
+}
+
+
+# =============================================================================
+# BLOK 8 – OPSLAAN IN DATABASE
+# =============================================================================
+# Schrijft de resultaten weg naar een lokale SQLite database.
+# Maakt twee tabellen aan: cpi_kwartaalmutatie en run_log.
+#
+# Parameters:
+#   data   – output van bereken_mutatie()
+#   db_pad – pad naar het SQLite bestand (default: ./output/cpi_resultaten.db)
+
+sla_op_in_database <- function(data, db_pad = "output/cpi_resultaten.db") {
+  
+  message(paste(">>> Opslaan in database:", db_pad))
+  
+  con <- dbConnect(RSQLite::SQLite(), db_pad)
+  on.exit(dbDisconnect(con))
+  
+  dbWriteTable(con, "cpi_kwartaalmutatie", data, overwrite = TRUE)
+  
+  log_entry <- data.frame(
+    run_timestamp = as.character(Sys.time()),
+    n_rijen       = nrow(data),
+    categorieen   = paste(unique(data$categorie_label), collapse = " | "),
+    r_versie      = R.version$version.string
+  )
+  dbWriteTable(con, "run_log", log_entry, append = TRUE)
+  
+  message(paste("    cpi_kwartaalmutatie:", nrow(data), "rijen opgeslagen."))
+  message("    run_log bijgewerkt.")
+}
+
+
+# =============================================================================
+# HOOFDPROCES – alles aan elkaar
+# =============================================================================
+# Roept de blokken 1 t/m 8 aan in volgorde.
+# Pas verslagperiode aan om te filteren, of laat NULL voor alle kwartalen.
+
+main <- function(verslagperiode = NULL) {
+  
+  message("========================================")
+  message("  CBS CPI Kwartaalmutatie – START")
+  message(paste("  Periode:", ifelse(is.null(verslagperiode),
+                                     "alle beschikbare kwartalen",
+                                     verslagperiode)))
+  message("========================================")
+  
+  dir.create("output", showWarnings = FALSE)
+  
+  # Blok 1a: juiste keys opzoeken vanuit CBS metadata
+  # Gebruik de 6-cijferige CBS-categorienummers:
+  # 041000 = Huur van woning
+  # 060000 = Gezondheid en zorg
+  keys <- zoek_categorie_keys(c("041000", "060000"))
+  
+  # Blok 1b: data ophalen met de gevonden keys
+  raw <- haal_data_op(keys)
+  
+  # Blok 2: opschonen
+  schoon <- schoon_data(raw)
+  
+  # Blok 3: filteren op periode
+  gefilterd <- filter_periode(schoon, verslagperiode)
+  
+  # Blok 4: kwartaalgemiddelden
+  kwartaal <- bereken_kwartaalgemiddelde(gefilterd)
+  
+  # Blok 5: mutatie berekenen
+  resultaat <- bereken_mutatie(kwartaal)
+  
+  # Blok 6 + 7: grafieken
+  maak_lijngrafiek(resultaat)
+  maak_staafdiagram(resultaat)
+  
+  # Blok 8: database
+  sla_op_in_database(resultaat)
+  
+  message("========================================")
+  message("  KLAAR – output staat in ./output/")
+  message("========================================")
+  
+  invisible(resultaat)
+}
+
+
+# --- Uitvoeren ----------------------------------------------------------------
+
+resultaat <- main()
+
+
+# Of voor een specifiek kwartaal en verder:
+# resultaat <- main(verslagperiode = "2023KW01")

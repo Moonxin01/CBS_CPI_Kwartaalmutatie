@@ -1,0 +1,26 @@
+{
+    "id": "5D052FDB",
+    "path": "~/Casus/script/cpi_kwartaalmutatie.R",
+    "project_path": "script/cpi_kwartaalmutatie.R",
+    "type": "r_source",
+    "hash": "3255671626",
+    "contents": "",
+    "dirty": true,
+    "created": 1772922857422.0,
+    "source_on_save": false,
+    "relative_order": 1,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "370,0",
+        "scrollLine": "273"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1772925039,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1772925053384,
+    "read_only": false,
+    "read_only_alternatives": []
+}
